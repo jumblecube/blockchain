@@ -3,6 +3,8 @@ import json
 from textwrap import dedent
 from time import time
 from uuid import uuid4
+from urllib.parse import urlparse
+import requests
 
 from flask import Flask, jsonify, request
 
@@ -11,6 +13,7 @@ class Blockchain(object):
     def __init__(self):
         self.chain = []
         self.current_transactions = []
+        self.nodes = set()
 
         # create the genesis block
         self.new_block(previous_hash=1, proof=100)
@@ -61,9 +64,54 @@ class Blockchain(object):
 
     @staticmethod
     def valid_proof(last_proof, proof):
-        guess = f'{last_proof}{proof}'.encode()
+        guess = str(last_proof)+str(proof)
         guess_hash = hashlib.sha256(guess).hexdigest()
         return guess_hash[:3] == "000"
+
+    def register_node(self, address):
+        parsed_url = urlparse(address)
+        self.nodes.add(parsed_url.netloc)
+
+    def valid_chain(self, chain):
+        last_block = chain[0]
+        current_index = 1
+
+        while current_index < len(chain):
+            block = chain[current_index]
+
+            if block['previous_hash'] != self.hash(last_block):
+                return False
+
+            if not self.valid_proof(last_block['proof'], block['proof']):
+                return False
+
+            last_block = block
+            current_index += 1
+
+        return True
+
+    def resolve_conflicts(self):
+        neighbours = self.nodes
+        new_chain = None
+
+        max_length = len(self.chain)
+
+        for node in neighbours:
+            response = requests.get(str('http://{}/chain'.format(node)))
+
+            if response.status_code == 200:
+                length = response.json()['length']
+                chain = response.json()['chain']
+
+            if length > max_length and self.valid_chain(chain):
+                max_length = length
+                new_chain = chain
+
+        if new_chain:
+            self.chain = new_chain
+            return True
+
+        return False
 
 
 # start a node
@@ -107,14 +155,16 @@ def new_transaction():
 
     # check the POST data
     required = ['sender', 'recipient', 'amount']
-    if not all(k in values for k in required):
-        return 'Missing values', 400
+    for k in values:
+        if k not in required:
+            return 'Missing values', 400
 
     # create a new transaction
     index = blockchain.new_transaction(values['sender'], values['recipient'],
                                        values['amount'])
 
-    response = {'message': f'Transaction will be added to Block {index}'}
+    response = {'message': str('Transaction will be added to block {}'
+                               .format(index))}
     return jsonify(response), 201
 
 
@@ -124,6 +174,42 @@ def full_chain():
         'chain': blockchain.chain,
         'length': len(blockchain.chain)
     }
+    return jsonify(response), 200
+
+
+@app.route('/nodes/register', methods=['POST'])
+def register_nodes():
+    values = request.get_json()
+
+    nodes = values.get('nodes')
+    if nodes is None:
+        return "Error: Please supply a valid list of nodes", 400
+
+    for node in nodes:
+        blockchain.register_node(node)
+
+    response = {
+        'message': 'New nodes added',
+        'total_nodes': list(blockchain.nodes),
+    }
+
+    return jsonify(response), 201
+
+
+@app.route('/nodes/resolve', methods=['GET'])
+def concensus():
+    replaced = blockchain.resolve_conflicts()
+
+    if replaced:
+        response = {
+            'message': 'Updated chain sourced',
+            'new_chain': blockchain.chain
+        }
+    else:
+        response = {
+                'message': 'Chain is authoratative',
+                'chain': blockchain.chain
+        }
     return jsonify(response), 200
 
 
